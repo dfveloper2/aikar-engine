@@ -404,11 +404,11 @@ class Gemma3nVisionAudioModel(ConformerAudioModel):
         self.hparams_vision["patch_size"] = image_size // image_seq_length
 
         # remap audio hparams
-        assert self.hparams_audio is not None
-        self.hparams_audio["n_layers"] = self.hparams_audio["conf_num_hidden_layers"]
-        self.hparams_audio["num_attention_heads"] = self.hparams_audio["conf_num_attention_heads"]
-        self.hparams_audio["feat_in"] = self.hparams_audio["input_feat_size"]
-        self.hparams_audio["intermediate_size"] = self.hparams_audio.get("intermediate_size", 6144)
+        if self.hparams_audio is not None:
+        	self.hparams_audio["n_layers"] = self.hparams_audio["conf_num_hidden_layers"]
+        	self.hparams_audio["num_attention_heads"] = self.hparams_audio["conf_num_attention_heads"]
+        	self.hparams_audio["feat_in"] = self.hparams_audio["input_feat_size"]
+        	self.hparams_audio["intermediate_size"] = self.hparams_audio.get("intermediate_size", 6144)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -418,10 +418,10 @@ class Gemma3nVisionAudioModel(ConformerAudioModel):
         self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams.get("layer_norm_eps", 1e-6))
 
         # audio params
-        assert self.hparams_audio is not None
-        self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.GEMMA3NA)
-        self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["feat_in"])
-        self.gguf_writer.add_audio_attention_layernorm_eps(1e-5)
+        if self.hparams_audio is not None:
+        	self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.GEMMA3NA)
+        	self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["feat_in"])
+        	self.gguf_writer.add_audio_attention_layernorm_eps(1e-5)
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         # Force quantization settings for specific tensor types
@@ -791,10 +791,10 @@ class Gemma4VisionAudioModel(MmprojModel):
         self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision.get("layer_norm_eps", 1e-6))
 
         # audio params
-        assert self.hparams_audio is not None
-        self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.GEMMA4A)
-        self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["feat_in"])
-        self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio.get("layer_norm_eps", 1e-6))
+        if self.hparams_audio is not None:
+        	self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.GEMMA4A)
+        	self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["feat_in"])
+        	self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio.get("layer_norm_eps", 1e-6))
 
     def is_audio_tensor(self, name: str) -> bool:
         return "audio_tower" in name or "embed_audio" in name
