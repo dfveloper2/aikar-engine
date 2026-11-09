@@ -7,6 +7,7 @@
 #include <sstream>
 #include <filesystem>
 #include <chrono>
+#include <random>
 
 static void check(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
@@ -14,13 +15,13 @@ static void check(bool ok, const char * message) {
 
 static double reference(const std::vector<float> & logits, const std::vector<int32_t> & ids,
         const std::vector<float> & logp, const std::vector<float> & weights, float temperature) {
-    constexpr int nv = 8, nr = 2, k = 3;
+    const int nr = weights.size(), nv = logits.size()/nr, k = ids.size()/nr;
     double loss = 0;
     for (int r = 0; r < nr; ++r) {
         double total = 0;
         const double maximum = *std::max_element(logits.begin() + r*nv, logits.begin() + (r+1)*nv);
         for (int j = 0; j < nv; ++j) total += std::exp((logits[r*nv+j] - maximum) / temperature);
-        bool selected[nv] = {};
+        std::vector<uint8_t> selected(nv, 0);
         for (int j = 0; j < k; ++j) {
             selected[ids[r*k+j]] = true;
             const double student_logp = (logits[r*nv+ids[r*k+j]] - maximum)/temperature - std::log(total);
@@ -35,24 +36,27 @@ static double reference(const std::vector<float> & logits, const std::vector<int
     return loss*temperature*temperature/nr;
 }
 
-static void loss_and_gradient(float temperature, bool masked, bool extreme = false, bool reference_mode = false) {
-    ggml_init_params params = {16*1024*1024, nullptr, false};
+static void loss_and_gradient(float temperature, bool masked, bool extreme = false, bool reference_mode = false,
+        ggml_backend_t backend = nullptr, int nv = 8) {
+    ggml_init_params params = {16*1024*1024, nullptr, backend != nullptr};
     auto * ctx = ggml_init(params);
     std::vector<float> values = {1.3f, -.2f, .5f, -1.f, .8f, -.8f, .1f, -.4f,
         -.1f, .4f, -.3f, 1.1f, .2f, -.5f, .7f, -.9f};
+    std::vector<int32_t> indices = {4, 0, 2, 6, 3, 1};
+    if (nv != 8) {
+        values.resize(size_t(nv)*2);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = std::sin(float(i)*0.07f);
+        indices[2] = nv - 1;
+        indices[5] = nv - 2;
+    }
     if (extreme) values[0] = 1000.f;
-    const std::vector<int32_t> indices = {4, 0, 2, 6, 3, 1};
     const std::vector<float> weights = {1.5f, masked ? 0.f : .5f};
     std::vector<float> targets = {.3f, .25f, .2f, .25f, .4f, .3f, .1f, .2f};
     for (auto & p : targets) p = std::log(p);
-    auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 2);
+    auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, 2);
     auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 2);
     auto * logp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 2);
     auto * row_weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
-    std::memcpy(logits->data, values.data(), values.size()*4);
-    std::memcpy(ids->data, indices.data(), indices.size()*4);
-    std::memcpy(logp->data, targets.data(), targets.size()*4);
-    std::memcpy(row_weights->data, weights.data(), weights.size()*4);
     ggml_set_param(logits);
     auto loss_function = reference_mode ? ggml_opt_distillation_loss_reference : ggml_opt_distillation_loss;
     auto * loss = loss_function(ctx, logits, ids, logp, row_weights, temperature);
@@ -60,12 +64,33 @@ static void loss_and_gradient(float temperature, bool masked, bool extreme = fal
     auto * graph = ggml_new_graph_custom(ctx, 256, true);
     ggml_build_forward_expand(graph, loss);
     ggml_build_backward_expand(ctx, graph, nullptr);
+    auto * buffer = backend ? ggml_backend_alloc_ctx_tensors(ctx, backend) : nullptr;
+    check(!backend || buffer, "cannot allocate GPU KL tensors");
+    const auto set = [&](ggml_tensor * tensor, const void * data, size_t size) {
+        if (backend) ggml_backend_tensor_set(tensor, data, 0, size);
+        else std::memcpy(tensor->data, data, size);
+    };
+    set(logits, values.data(), values.size()*4);
+    set(ids, indices.data(), indices.size()*4);
+    set(logp, targets.data(), targets.size()*4);
+    set(row_weights, weights.data(), weights.size()*4);
     ggml_graph_reset(graph);
-    check(ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS, "loss graph failed");
+    check((backend ? ggml_backend_graph_compute(backend, graph) : ggml_graph_compute_with_ctx(ctx, graph, 2)) ==
+            GGML_STATUS_SUCCESS, "loss graph failed");
+    float actual_loss;
+    std::vector<float> gradient(values.size());
+    if (backend) {
+        ggml_backend_tensor_get(loss, &actual_loss, 0, 4);
+        ggml_backend_tensor_get(ggml_graph_get_grad(graph, logits), gradient.data(), 0, gradient.size()*4);
+    } else {
+        actual_loss = *static_cast<float *>(loss->data);
+        std::memcpy(gradient.data(), ggml_graph_get_grad(graph, logits)->data, gradient.size()*4);
+    }
     const double expected = reference(values, indices, targets, weights, temperature);
-    check(std::abs(*static_cast<float *>(loss->data) - expected) < 2e-5 + 1e-6*std::abs(expected), "KL differs from reference");
-    const auto * gradient = static_cast<const float *>(ggml_graph_get_grad(graph, logits)->data);
-    for (size_t i = 0; i < values.size(); ++i) {
+    check(std::abs(actual_loss - expected) < 2e-5 + 1e-6*std::abs(expected), "KL differs from reference");
+    for (size_t test = 0; test < std::min<size_t>(32, values.size()); ++test) {
+        const size_t i = values.size() <= 32 ? test : test < indices.size() ?
+                (test/3)*nv + indices[test] : (test - 6)*(values.size() - 1)/25;
         const float original = values[i];
         const float eps = 0.001f;
         values[i] = original + eps;
@@ -77,7 +102,65 @@ static void loss_and_gradient(float temperature, bool masked, bool extreme = fal
         values[i] = original;
         check(std::abs(gradient[i] - (plus-minus)/(upper-lower)) < 2e-4, "KL gradient differs from finite difference");
     }
+    ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+}
+
+static void encoder_checks() {
+    std::mt19937 random(42);
+    for (uint32_t vocab : {13u, 257u, 262144u}) for (uint32_t k : {1u, 7u, std::min(512u, vocab - 1)}) {
+        logit_distillation::header h;
+        h.vocab = vocab;
+        h.top_k = k;
+        for (float temperature : {0.5f, 1.f, 2.f}) {
+            h.temperature = temperature;
+            logit_distillation::row_encoder encoder(h);
+            std::vector<float> logits(vocab);
+            std::vector<uint8_t> encoded(h.row_bytes());
+            std::vector<int32_t> expected(vocab), actual(k);
+            std::vector<uint8_t> selected(vocab);
+            // Reuse the encoder across ties, ordered values and changing top-k sets.
+            for (int pattern = 0; pattern < 5; ++pattern) {
+                for (uint32_t i = 0; i < vocab; ++i) {
+                    logits[i] = pattern == 0 ? 0 : pattern == 1 ? float(i)*0.001f :
+                            pattern == 2 ? -float(i)*0.001f : float(int(random()%2001) - 1000)*0.01f;
+                }
+                std::iota(expected.begin(), expected.end(), 0);
+                std::sort(expected.begin(), expected.end(), [&](int32_t a, int32_t b) {
+                    return logits[a] != logits[b] ? logits[a] > logits[b] : a < b;
+                });
+                std::fill(selected.begin(), selected.end(), 0);
+                for (uint32_t i = 0; i < k; ++i) selected[expected[i]] = 1;
+                const double maximum = logits[expected[0]];
+                double total = 0, tail = 0;
+                for (uint32_t i = 0; i < vocab; ++i) {
+                    const double p = std::exp((double(logits[i]) - maximum)/temperature);
+                    total += p;
+                    if (!selected[i]) tail += p;
+                }
+                check(encoder.encode(encoded.data(), logits.data()) == tail/total, "teacher tail differs from full-sort reference");
+                std::memcpy(actual.data(), encoded.data(), k*4);
+                check(std::equal(actual.begin(), actual.end(), expected.begin()), "bounded heap changed top-k IDs or tie order");
+                for (uint32_t i = 0; i < k; ++i) {
+                    ggml_fp16_t actual_logp;
+                    std::memcpy(&actual_logp, encoded.data() + k*4 + i*2, 2);
+                    const float value = (double(logits[expected[i]]) - maximum)/temperature - std::log(total);
+                    check(actual_logp == ggml_fp32_to_fp16(value), "encoded top-k probability changed");
+                }
+                float actual_tail;
+                std::memcpy(&actual_tail, encoded.data() + k*6, 4);
+                check(actual_tail == float(std::log(std::max(tail, 1e-300)) - std::log(total)), "encoded tail probability changed");
+            }
+            for (uint32_t index : {0u, vocab - 1}) for (float invalid : {INFINITY, -INFINITY, NAN}) {
+                logits[index] = invalid;
+                bool rejected = false;
+                try { encoder.encode(encoded.data(), logits.data()); }
+                catch (const std::exception &) { rejected = true; }
+                check(rejected, "non-finite teacher logit accepted");
+                logits[index] = 0;
+            }
+        }
+    }
 }
 
 static void cache_checks() {
@@ -132,20 +215,40 @@ static void cache_checks() {
         double sum = 0;
         for (float p : probabilities) sum += std::exp(double(p));
         check(std::abs(sum - 1) < 1e-6, "FP16 teacher distribution was not renormalized");
-        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
-        file.seekp(offset + 4);
-        file.write(reinterpret_cast<const char *>(ids), 4);
-        file.close();
+        for (int32_t invalid : {ids[0], -1, int32_t(h.vocab), INT32_MAX}) {
+            std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+            file.seekp(offset + 4);
+            file.write(reinterpret_cast<const char *>(&invalid), 4);
+            file.close();
+            bool rejected = false;
+            try {
+                logit_distillation::cache corrupted(path.string());
+                corrupted.row(offset, ids, probabilities);
+            } catch (const std::exception &) { rejected = true; }
+            check(rejected, "invalid or duplicate cache ID accepted");
+        }
     }
-    bool duplicate_rejected = false;
-    try {
+    {
+        logit_distillation::header boundary = h;
+        boundary.vocab = 130;
+        boundary.top_k = 4;
+        std::vector<float> boundary_logits(130, -10);
+        const int32_t expected[] = {0, 63, 64, 129};
+        for (int i = 0; i < 4; ++i) boundary_logits[expected[i]] = 4 - i;
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        boundary.save(file);
+        const uint64_t offset = file.tellp();
+        logit_distillation::encode_row(file, boundary_logits.data(), boundary);
+        file.close();
         logit_distillation::cache loaded(path.string());
-        int32_t ids[3];
-        float probabilities[4];
-        loaded.row(loaded.in.tellg(), ids, probabilities);
-    } catch (const std::exception &) { duplicate_rejected = true; }
+        int32_t ids[4];
+        float logp[5];
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            loaded.row(offset, ids, logp);
+            check(std::equal(ids, ids + 4, expected), "cache bitmap failed across word boundaries or row reuse");
+        }
+    }
     std::filesystem::remove(path);
-    check(duplicate_rejected, "duplicate cache IDs accepted");
     std::istringstream in(content, std::ios::binary);
     logit_distillation::header restored;
     restored.load(in);
@@ -506,6 +609,7 @@ int main(int argc, char ** argv) {
             loss_and_gradient(t, true, false, reference_mode);
             loss_and_gradient(t, false, true, reference_mode);
         }
+        encoder_checks();
         cache_checks();
         frozen_q41_moe_gradient();
         auto * cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
@@ -517,6 +621,15 @@ int main(int argc, char ** argv) {
             auto * first = ggml_backend_dev_by_name("CUDA0");
             auto * second = ggml_backend_dev_by_name("CUDA1");
             check(first && second, "copy regression requires two CUDA devices");
+            for (auto * device : {first, second}) {
+                auto * backend = ggml_backend_dev_init(device, nullptr);
+                check(backend != nullptr, "cannot initialize CUDA KL backend");
+                for (int nv : {8, 4097, 262144, 262145}) for (float t : {1.f, 2.f}) {
+                    loss_and_gradient(t, false, false, false, backend, nv);
+                    loss_and_gradient(t, true, true, false, backend, nv);
+                }
+                ggml_backend_free(backend);
+            }
             // The internal collective can round inputs to BF16; this reference checks F32 peer reduction.
             const char * allreduce = std::getenv("GGML_CUDA_ALLREDUCE");
             if (allreduce && std::strcmp(allreduce, "none") == 0) tensor_parallel_backward(first, second);

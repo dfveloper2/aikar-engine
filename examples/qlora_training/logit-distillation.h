@@ -167,16 +167,26 @@ class row_encoder {
     std::vector<uint8_t> selected;
     std::vector<ggml_fp16_t> logp;
 public:
-    explicit row_encoder(const header & info) : h(info), ids(h.vocab), selected(h.vocab, 0), logp(h.top_k) {
-        std::iota(ids.begin(), ids.end(), 0);
-    }
+    explicit row_encoder(const header & info) : h(info), ids(h.top_k), selected(h.vocab, 0), logp(h.top_k) {}
 
     double encode(uint8_t * output, const float * logits) {
-        for (uint32_t i = 0; i < h.vocab; ++i) require(std::isfinite(logits[i]), "non-finite teacher logits");
         const auto greater = [&](int32_t a, int32_t b) {
             return logits[a] != logits[b] ? logits[a] > logits[b] : a < b;
         };
-        std::partial_sort(ids.begin(), ids.begin() + h.top_k, ids.end(), greater);
+        for (uint32_t i = 0; i < h.top_k; ++i) {
+            require(std::isfinite(logits[i]), "non-finite teacher logits");
+            ids[i] = i;
+        }
+        std::make_heap(ids.begin(), ids.end(), greater);
+        // Keep only the candidates. Scan logits in token order to avoid vocabulary-sized index traffic.
+        for (uint32_t i = h.top_k; i < h.vocab; ++i) {
+            require(std::isfinite(logits[i]), "non-finite teacher logits");
+            if (!greater(i, ids.front())) continue;
+            std::pop_heap(ids.begin(), ids.end(), greater);
+            ids.back() = i;
+            std::push_heap(ids.begin(), ids.end(), greater);
+        }
+        std::sort_heap(ids.begin(), ids.end(), greater);
         const double maximum = logits[ids[0]];
         for (uint32_t i = 0; i < h.top_k; ++i) selected[ids[i]] = 1;
         double total = 0;
@@ -251,14 +261,14 @@ public:
     std::ifstream in;
     std::vector<uint64_t> offsets;
     std::vector<uint8_t> row_buffer;
-    std::vector<int32_t> sorted_ids;
+    std::vector<uint64_t> seen_ids;
     uint64_t next_offset = 0;
 
     explicit cache(const std::string & path) : in(path, std::ios::binary) {
         require(bool(in), "cannot open " + path);
         info.load(in);
         row_buffer.resize(info.row_bytes());
-        sorted_ids.resize(info.top_k);
+        seen_ids.resize((size_t(info.vocab) + 63)/64);
     }
 
     void attach(ggml_opt_dataset_t dataset, int64_t split, const llama_vocab * vocab) {
@@ -309,10 +319,14 @@ public:
         next_offset = offset + row_buffer.size();
         std::memcpy(ids, row_buffer.data(), size_t(info.top_k)*4);
         std::memcpy(logp + info.top_k, row_buffer.data() + size_t(info.top_k)*6, 4);
-        std::copy_n(ids, info.top_k, sorted_ids.begin());
-        std::sort(sorted_ids.begin(), sorted_ids.end());
-        require(sorted_ids.front() >= 0 && uint32_t(sorted_ids.back()) < info.vocab &&
-                std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) == sorted_ids.end(), "invalid or duplicate teacher IDs");
+        std::fill(seen_ids.begin(), seen_ids.end(), 0);
+        for (uint32_t i = 0; i < info.top_k; ++i) {
+            require(ids[i] >= 0 && uint32_t(ids[i]) < info.vocab, "invalid or duplicate teacher IDs");
+            const uint64_t bit = uint64_t(1) << (ids[i] % 64);
+            auto & word = seen_ids[ids[i] / 64];
+            require(!(word & bit), "invalid or duplicate teacher IDs");
+            word |= bit;
+        }
         double total = 0;
         for (uint32_t i = 0; i <= info.top_k; ++i) {
             if (i < info.top_k) {

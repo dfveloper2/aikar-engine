@@ -84,8 +84,12 @@ int main(int argc, char ** argv) {
             const size_t base = size_t(w)*info.context;
             logit_distillation::write(out, tokens + base, size_t(info.context)*4);
             logit_distillation::write(out, labels + base, size_t(info.context)*4);
+            uint32_t prediction_end = info.context;
+            while (prediction_end > 0 && labels[base + prediction_end - 1] < 0) --prediction_end;
+            // Skip unused trailing microbatches, but keep batch shapes for identical quantized results.
+            if (prediction_end == 0) continue;
             llama_memory_clear(llama_get_memory(teacher->context()), true);
-            for (uint32_t begin = 0; begin < info.context; begin += params.n_ubatch) {
+            for (uint32_t begin = 0; begin < prediction_end; begin += params.n_ubatch) {
                 batch.clear();
                 const uint32_t end = std::min<uint32_t>(info.context, begin + params.n_ubatch);
                 for (uint32_t pos = begin; pos < end; ++pos) {

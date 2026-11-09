@@ -10038,9 +10038,10 @@ struct test_cross_entropy_loss_sparse : public test_case {
 struct test_distillation : public test_case {
     const int64_t nv, nr, k;
     const float temperature;
-    test_distillation(int64_t nv, int64_t nr, int64_t k, float temperature)
-        : nv(nv), nr(nr), k(k), temperature(temperature) {}
-    std::string vars() override { return VARS_TO_STR4(nv, nr, k, temperature); }
+    const bool extreme;
+    test_distillation(int64_t nv, int64_t nr, int64_t k, float temperature, bool extreme = false)
+        : nv(nv), nr(nr), k(k), temperature(temperature), extreme(extreme) {}
+    std::string vars() override { return VARS_TO_STR5(nv, nr, k, temperature, extreme); }
     double max_nmse_err() override { return 1e-6; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, nr);
@@ -10067,6 +10068,10 @@ struct test_distillation : public test_case {
             } else if (std::strcmp(t->name, "kd_weights") == 0) {
                 std::vector<float> values(nr, 1.0f);
                 values[0] = 0;
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else if (extreme && std::strcmp(t->name, "kd_logits") == 0) {
+                std::vector<float> values(nv*nr, -1000.f);
+                for (int64_t r = 0; r < nr; ++r) for (int64_t i = 0; i < k; ++i) values[r*nv+(i+r)%nv] = 1000.f;
                 ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
             } else {
                 init_tensor_uniform(t, -3.0f, 3.0f);
@@ -13873,6 +13878,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_distillation(8, 3, 3, 1.0f));
     test_cases.emplace_back(new test_distillation(64, 5, 7, 2.0f));
     test_cases.emplace_back(new test_distillation(262144, 8, 512, 1.0f));
+    test_cases.emplace_back(new test_distillation(257, 3, 128, 0.5f));
+    test_cases.emplace_back(new test_distillation(4097, 3, 512, 2.0f));
+    test_cases.emplace_back(new test_distillation(262145, 3, 512, 1.0f));
+    test_cases.emplace_back(new test_distillation(262144, 3, 4096, 1.0f));
+    test_cases.emplace_back(new test_distillation(64, 3, 63, 2.0f, true));
+    test_cases.emplace_back(new test_distillation(262144, 3, 512, 2.0f, true));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
